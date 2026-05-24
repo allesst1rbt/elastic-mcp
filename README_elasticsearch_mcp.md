@@ -55,11 +55,26 @@ python mcp/elasticsearch_mcp.py
 
 ## Running Tests
 
+All tests use `respx` to mock HTTP calls to Elasticsearch.
+**No live Elasticsearch instance is required.**
+
 ```bash
-pytest tests/test_elasticsearch_mcp.py -v
+# Install dependencies
+pip install -r requirements.txt
+
+# Run all tests
+pytest tests/ -v
+
+# Run with coverage
+pip install pytest-cov
+pytest tests/ -v --cov=mcp --cov-report=term-missing
 ```
 
-All 10 tests use `respx` to mock HTTP calls — no live Elasticsearch needed.
+Tests cover:
+- Happy path: hits returned, frequency counted, context formatted
+- Edge cases: empty `trace_id`, index not found (404), no results
+- Error handling: 401 `PermissionError`, timeout, 5xx `RuntimeError`
+- Truncation: `get_trace_context` capped at 8000 chars
 
 ---
 

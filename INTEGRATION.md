@@ -7,7 +7,7 @@ The Elasticsearch MCP server is a read-only data enrichment layer inside the **H
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    DLQ Event Source                             │
-│            (Kafka / RabbitMQ / SQS dead-letter queue)           │
+│            (GCP Pub/Sub Dead Letter Topic)                      │
 └────────────────────────┬────────────────────────────────────────┘
                          │  raw DLQ message
                          ▼
@@ -138,10 +138,14 @@ The orchestrator selects the sub-agent based on the DLQ message topic/queue name
 3. get_error_frequency(error_type, index, window="24h")
       │   returns: {count, first_seen, last_seen, pattern}
       │
-4. classify:
-      │   count == 0          → novel error    → escalate to on-call agent
-      │   0 < count < 10      → recurring      → route to domain agent
-      │   count >= 10         → error storm    → suppress + alert agent
+4. classify (thresholds read from orchestrator env vars):
+      │   count == 0                                    → novel error → escalate to on-call
+      │   0 < count <= DLQ_RECURRING_MAX_COUNT          → recurring   → route to domain agent
+      │   count > DLQ_RECURRING_MAX_COUNT (in window)  → error storm → suppress + page infra
+      │
+      │   defaults: DLQ_RECURRING_MAX_COUNT=50, DLQ_STORM_WINDOW=1h
+      │   override via env to tune per-queue (e.g. platform-techfin-exchanges
+      │   has steady ~27 msg/h and should NOT trigger storm at default threshold)
       │
 5. get_trace_context(trace_id, index, time_range)
       │   returns: formatted string ≤ 8000 chars
@@ -162,6 +166,8 @@ The orchestrator selects the sub-agent based on the DLQ message topic/queue name
 | `ELASTICSEARCH_URL` | deployment / CI secret | MCP server (required) |
 | `ELASTICSEARCH_API_KEY` | deployment / CI secret | MCP server (required) |
 | `ELASTICSEARCH_INDEX_PREFIX` | orchestrator config | orchestrator (used to build index pattern strings passed to tools) |
+| `DLQ_RECURRING_MAX_COUNT` | orchestrator config | orchestrator (default: `50`) — upper bound for "recurring" classification |
+| `DLQ_STORM_WINDOW` | orchestrator config | orchestrator (default: `1h`) — Elasticsearch date math window for storm detection |
 
 The MCP server reads `ELASTICSEARCH_URL` and `ELASTICSEARCH_API_KEY` at startup. If either is missing, the process exits immediately with `KeyError` before serving any requests.
 
@@ -186,3 +192,20 @@ MCP tool errors surface as `McpError` exceptions on the client side. The orchest
 - For high-throughput DLQ pipelines, run multiple orchestrator workers, each with its own MCP subprocess. No shared state.
 - `get_trace_context` truncates output at 8000 characters. For traces longer than that, the orchestrator can call `search_logs` directly and paginate by adjusting `time_range`.
 - The 100-hit cap in `search_logs` is intentional to protect context window size. If the orchestrator needs more, it should narrow the `time_range` rather than raise the cap.
+
+---
+
+## Connection: GitHub Webhook → Re-enqueue Flow
+
+After a data-fix Alembic migration PR is merged, the re-enqueue flow runs:
+
+1. GitHub fires `pull_request` webhook with `action: closed` + `merged: true`
+2. `webhooks/github_webhook.py` identifies the DLQ message via `pr_metadata`
+   stored by the agent when opening the PR
+3. Webhook handler calls MCP GCloud to republish the original message
+   to the original Pub/Sub topic (NOT the Dead Letter Topic)
+4. Pub/Sub consumer reprocesses the message with the migration already applied
+5. If the message fails again → returns to Dead Letter Topic → system restarts from step 2
+
+The Elasticsearch MCP server is **not involved** in this flow.
+It is only called during context enrichment (steps 2–3 of the DLQ lifecycle above).
